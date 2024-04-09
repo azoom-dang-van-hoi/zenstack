@@ -231,6 +231,7 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
 
         const origArgs = args;
         args = this.utils.clone(args);
+        console.log('args', args);
 
         // static input policy check for top-level create data
         const inputCheck = this.utils.checkInputGuard(this.model, args.data, 'create');
@@ -475,7 +476,7 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
         }
     }
 
-    async createMany(args: { data: any; skipDuplicates?: boolean }) {
+    async createMany(args: { data: any; skipDuplicates?: boolean }, config: any) {
         if (!args) {
             throw prismaClientValidationError(this.prisma, this.options, 'query argument is required');
         }
@@ -518,9 +519,9 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
         } else {
             // create entities in a transaction with post-create checks
             return this.transaction(async (tx) => {
-                const { result, postWriteChecks } = await this.doCreateMany(this.model, args, tx);
+                const { result, postWriteChecks } = await this.doCreateMany(this.model, { ...args, config }, tx);
                 // post-create check
-                await this.runPostWriteChecks(postWriteChecks, tx);
+                await this.runCreateManyChecks(postWriteChecks, tx);
                 return result;
             });
         }
@@ -528,12 +529,12 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
 
     private async doCreateMany(
         model: string,
-        args: { data: any; skipDuplicates?: boolean },
+        args: { data: any; skipDuplicates?: boolean; config: any },
         db: Record<string, DbOperations>
     ) {
         // We can't call the native "createMany" because we can't get back what was created
         // for post-create checks. Instead, do a "create" for each item and collect the results.
-
+        console.log('create many', args.config);
         let createResult = await Promise.all(
             enumerate(args.data).map(async (item) => {
                 if (args.skipDuplicates) {
@@ -1425,6 +1426,25 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
                 this.utils.checkPolicyForUnique(model, uniqueFilter, operation, db, undefined, preValue)
             )
         );
+    }
+
+    private async runCreateManyChecks(postWriteChecks: PostWriteCheckRecord[], db: Record<string, DbOperations>) {
+        const model = postWriteChecks[0].model as string;
+        const operation = 'create' as PolicyOperationKind;
+        const uniqueFilter = postWriteChecks.map((item) => item.uniqueFilter?.id ?? item.uniqueFilter);
+        const guard = this.utils.getAuthGuard(db, model, operation);
+        const data = await db[model].findMany({
+            where: {
+                id: {
+                    in: uniqueFilter,
+                },
+                ...guard,
+            },
+            select: {
+                id: true,
+            },
+        });
+        console.log('data', data);
     }
 
     private makeHandler(model: string) {

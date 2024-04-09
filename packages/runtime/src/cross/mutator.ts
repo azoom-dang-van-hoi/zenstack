@@ -54,6 +54,7 @@ export async function applyMutation(
         },
 
         createMany: (model, args) => {
+            console.log('mutation')
             if (model === queryModel && args?.data) {
                 for (const oneArg of enumerate(args.data)) {
                     const r = createMutate(queryModel, queryOp, resultData, oneArg, modelMeta, logging);
