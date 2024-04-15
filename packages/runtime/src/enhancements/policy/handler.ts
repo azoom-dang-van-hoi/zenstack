@@ -231,7 +231,6 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
 
         const origArgs = args;
         args = this.utils.clone(args);
-        console.log('args', args);
 
         // static input policy check for top-level create data
         const inputCheck = this.utils.checkInputGuard(this.model, args.data, 'create');
@@ -476,7 +475,7 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
         }
     }
 
-    async createMany(args: { data: any; skipDuplicates?: boolean }, config: any) {
+    async createMany(args: { data: any; skipDuplicates?: boolean }) {
         if (!args) {
             throw prismaClientValidationError(this.prisma, this.options, 'query argument is required');
         }
@@ -517,13 +516,11 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
         if (!needPostCreateCheck) {
             return this.modelClient.createMany(args);
         } else {
+            // Post-create check
+            await this.runPreCreateManyChecks(args, this.model, this.prisma);
             // create entities in a transaction with post-create checks
-            return this.transaction(async (tx) => {
-                const { result, postWriteChecks } = await this.doCreateMany(this.model, { ...args, config }, tx);
-                // post-create check
-                await this.runCreateManyChecks(postWriteChecks, tx);
-                return result;
-            });
+            return await this.modelClient.createMany(args);
+            // create entities in a transaction with post-create checks
         }
     }
 
@@ -643,6 +640,103 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
         }
 
         return false;
+    }
+
+    //#endregion
+
+    //#region Create many and return data
+
+    async createManyAndReturn(args: { data: any; skipDuplicates?: boolean }, config: any) {
+        if (!args) {
+            throw prismaClientValidationError(this.prisma, this.options, 'query argument is required');
+        }
+        if (!args.data) {
+            throw prismaClientValidationError(this.prisma, this.options, 'data field is required in query argument');
+        }
+
+        this.utils.tryReject(this.prisma, this.model, 'create');
+
+        args = this.utils.clone(args);
+
+        // go through create items, statically check input to determine if post-create
+        // check is needed, and also validate zod schema
+        let needPostCreateCheck = false;
+        for (const item of enumerate(args.data)) {
+            const validationResult = this.validateCreateInputSchema(this.model, item);
+            if (validationResult !== item) {
+                this.utils.replace(item, validationResult);
+            }
+
+            const inputCheck = this.utils.checkInputGuard(this.model, item, 'create');
+            if (inputCheck === false) {
+                // unconditionally deny
+                throw this.utils.deniedByPolicy(
+                    this.model,
+                    'create',
+                    undefined,
+                    CrudFailureReason.ACCESS_POLICY_VIOLATION
+                );
+            } else if (inputCheck === true) {
+                // unconditionally allow
+            } else if (inputCheck === undefined) {
+                // static policy check is not possible, need to do post-create check
+                needPostCreateCheck = true;
+            }
+        }
+
+        if (!needPostCreateCheck) {
+            return this.modelClient.createMany(args);
+        } else {
+            // create entities in a transaction with post-create checks
+            return this.transaction(async (tx) => {
+                const { result, postWriteChecks } = await this.doCreateManyAndReturn(
+                    this.model,
+                    { ...args, config },
+                    tx
+                );
+                // post-create check
+                await this.runCreateManyChecks(postWriteChecks, tx);
+                return result;
+            });
+        }
+    }
+
+    private async doCreateManyAndReturn(
+        model: string,
+        args: { data: any; skipDuplicates?: boolean; config?: any },
+        db: Record<string, DbOperations>
+    ) {
+        // We can't call the native "createMany" because we can't get back what was created
+        // for post-create checks. Instead, do a "create" for each item and collect the results.
+        let createResult = await Promise.all(
+            enumerate(args.data).map(async (item) => {
+                if (args.skipDuplicates) {
+                    if (await this.hasDuplicatedUniqueConstraint(model, item, undefined, db)) {
+                        if (this.shouldLogQuery) {
+                            this.logger.info(`[policy] \`createMany\` skipping duplicate ${formatObject(item)}`);
+                        }
+                        return undefined;
+                    }
+                }
+
+                if (this.shouldLogQuery) {
+                    this.logger.info(`[policy] \`create\` for \`createMany\` ${model}: ${formatObject(item)}`);
+                }
+                return await db[model].create({ select: this.utils.makeIdSelection(model), data: item });
+            })
+        );
+
+        // filter undefined values due to skipDuplicates
+        createResult = createResult.filter((p) => !!p);
+
+        return {
+            result: { count: createResult.length },
+            postWriteChecks: createResult.map((item) => ({
+                model,
+                operation: 'create' as PolicyOperationKind,
+                uniqueFilter: item,
+            })),
+        };
     }
 
     //#endregion
@@ -1431,20 +1525,183 @@ export class PolicyProxyHandler<DbClient extends DbClientContract> implements Pr
     private async runCreateManyChecks(postWriteChecks: PostWriteCheckRecord[], db: Record<string, DbOperations>) {
         const model = postWriteChecks[0].model as string;
         const operation = 'create' as PolicyOperationKind;
-        const uniqueFilter = postWriteChecks.map((item) => item.uniqueFilter?.id ?? item.uniqueFilter);
+        const uniqueFilterNames = Object.keys(postWriteChecks[0].uniqueFilter);
+        const uniqueFilter = postWriteChecks.reduce(
+            (acc, item) => {
+                Object.keys(acc).forEach((key) => {
+                    acc[key].in.push(item.uniqueFilter[key]);
+                });
+                return acc;
+            },
+            uniqueFilterNames.reduce((acc, key) => {
+                acc[key] = {
+                    in: [],
+                };
+                return acc;
+            }, {} as { [key: string]: { in: any[] } })
+        );
         const guard = this.utils.getAuthGuard(db, model, operation);
         const data = await db[model].findMany({
             where: {
-                id: {
-                    in: uniqueFilter,
-                },
+                ...uniqueFilter,
                 ...guard,
             },
             select: {
-                id: true,
+                ...uniqueFilterNames.reduce((acc, key) => {
+                    acc[key] = true;
+                    return acc;
+                }, {} as { [key: string]: boolean }),
             },
         });
-        console.log('data', data);
+
+        // Checking data
+        const dataSet = new Set();
+        data.forEach((item) =>
+            dataSet.add(
+                `${uniqueFilterNames.reduce((acc, key) => {
+                    return `${acc}-${item[key]}`;
+                }, 'key')}`
+            )
+        );
+
+        const failData = postWriteChecks
+            .filter((item) => {
+                const key = uniqueFilterNames.reduce((acc, key) => {
+                    return `${acc}-${item.uniqueFilter[key]}`;
+                }, 'key');
+                return !dataSet.has(key);
+            })
+            .map((item) => item.uniqueFilter);
+        if (failData.length) {
+            throw new Error(
+                JSON.stringify({
+                    createdFail: failData,
+                })
+            );
+        }
+    }
+
+    private async runPreCreateManyChecks(
+        args: { data: any; skipDuplicates?: boolean },
+        model: string,
+        db: Record<string, DbOperations>
+    ) {
+        const queryData: { [key: string]: Set<any> } = {};
+        const references = this.utils.getReferencesField(model);
+        const guard = this.utils.getAuthGuard(db, model, 'create');
+
+        async function evaluate(subConfig: any, currentItem: any): Promise<boolean> {
+            if (typeof subConfig !== 'object' || subConfig === null) {
+                return true; // Xử lý trường hợp giá trị nguyên thủy
+            }
+
+            for (const key in subConfig) {
+                const referenceMapping = references.find(({ name }) => name === key);
+                if (key.toLowerCase() === 'and') {
+                    const results = await Promise.all(
+                        subConfig[key].map((config: any) => evaluate(config, currentItem))
+                    );
+                    if (!results.every(Boolean)) return false;
+                } else if (key.toLowerCase() === 'or') {
+                    const results = await Promise.all(
+                        subConfig[key].map((config: any) => evaluate(config, currentItem))
+                    );
+                    if (results.some((item) => Boolean(item))) return true;
+                    return false;
+                } else if (referenceMapping) {
+                    // Xử lý trường hợp referance to other table
+                    const result = await queryByCondition(subConfig[key], args.data, referenceMapping);
+                    if (!checkDataResult(result, currentItem, referenceMapping)) return false;
+                } else if (
+                    typeof subConfig[key] === 'object' &&
+                    (subConfig[key]['AND'] || subConfig[key]['and'] || subConfig[key]['OR'] || subConfig[key]['or'])
+                ) {
+                    return await evaluate(subConfig[key], currentItem);
+                } else {
+                    return checkCondition(subConfig, key, currentItem);
+                }
+            }
+
+            return true;
+        }
+
+        function checkCondition(config: any, key: string, currentItem: any) {
+            const condition = config[key];
+            let compareFunc;
+            if (typeof condition !== 'object' || condition === null) {
+                compareFunc = (item: any) => item[key] === condition;
+            } else if (condition.in && Array.isArray(condition.in)) {
+                compareFunc = (item: any) => condition.in.includes(item[key]);
+            } else if (condition.notIn && Array.isArray(condition.notIn)) {
+                compareFunc = (item: any) => condition.notIn.includes(item[key]);
+            } else if (condition.gt || condition.gt === 0) {
+                compareFunc = (item: any) => item[key] > condition.gt;
+            } else if (condition.gte || condition.gte === 0) {
+                compareFunc = (item: any) => item[key] >= condition.gte;
+            } else if (condition.lt || condition.lt === 0) {
+                compareFunc = (item: any) => item[key] < condition.lt;
+            } else if (condition.lte || condition.lt === 0) {
+                compareFunc = (item: any) => item[key] <= condition.lte;
+            } else if (condition.not) {
+                compareFunc = (item: any) => item[key] !== condition.not;
+            } else if (condition.contains) {
+                compareFunc = (item: any) => item[key].includes(condition.contains);
+            }
+            return compareFunc && compareFunc(currentItem);
+        }
+
+        function checkDataResult(result: Set<any>, currentItem: any, referenceMapping: any) {
+            return result.has(currentItem[referenceMapping.field]);
+        }
+
+        async function queryByCondition(
+            config: object,
+            data = [],
+            referenceMapping: { name: string; reference?: string; field?: string }
+        ) {
+            if (!referenceMapping.field || !referenceMapping.reference) {
+                throw new Error(`Need create data before relation it`);
+            }
+            const key = `${referenceMapping.name}-${JSON.stringify(config)}`;
+            if (queryData[key]) return queryData[key];
+            queryData[key] = new Set();
+            const idUniqueList: Set<any> = new Set();
+            data.forEach((item) => {
+                idUniqueList.add(item[referenceMapping.field as string]);
+            });
+            const idList: Array<any> = [];
+            idUniqueList.forEach((item) => idList.push(item));
+            const values = await db[referenceMapping.name].findMany({
+                where: {
+                    [referenceMapping.reference]: {
+                        in: idList,
+                    },
+                    ...config,
+                },
+                select: {
+                    [referenceMapping.reference]: true,
+                },
+            });
+            values.forEach((val) => queryData[key].add(val[referenceMapping.reference as string]));
+            return queryData[key];
+        }
+        
+        // Check first item and fetch data once
+        const checkedFirstItem = await evaluate(guard, args.data[0]);
+        const failedData = checkedFirstItem ? [] : [args.data[0]];
+
+        await Promise.all(args.data.slice(1).map((item: any) => evaluate(guard, item))).then((results) => {
+            results.forEach((checked: boolean, index: number) => {
+                if (!checked) {
+                    failedData.push(args.data[index + 1]);
+                }
+            });
+        });
+
+        if (failedData.length) {
+            throw new Error(JSON.stringify({ failedData }));
+        }
+        // return evaluate(guard);
     }
 
     private makeHandler(model: string) {
