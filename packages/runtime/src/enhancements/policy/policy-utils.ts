@@ -1389,5 +1389,22 @@ export class PolicyUtil {
         return guard;
     }
 
+    getReferencesField(model: string) {
+        const fields = this.modelMeta.fields[model];
+        if (!fields) {
+            throw this.unknownError(`unable to load policy guard for ${model}`);
+        }
+        return Object.values(fields).reduce((acc, value) => {
+            if (value.isDataModel) {
+                acc.push({
+                    name: value.name,
+                    field: Object.values(value.foreignKeyMapping ?? {})[0],
+                    reference: Object.keys(value.foreignKeyMapping ?? {})[0],
+                });
+            }
+            return acc;
+        }, [] as { name: string; field?: string; reference?: string }[]);
+    }
+
     //#endregion
 }

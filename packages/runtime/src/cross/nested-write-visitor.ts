@@ -145,6 +145,8 @@ export class NestedWriteVisitor {
             return;
         }
 
+        console.log('doVisit')
+
         const toplevel = field == undefined;
 
         const context = { parent, field, nestingPath: [...nestingPath] };

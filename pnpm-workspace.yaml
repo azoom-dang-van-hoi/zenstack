@@ -2,5 +2,4 @@ packages:
     - 'packages/*'
     - 'packages/plugins/*'
     - 'packages/misc/*'
-    - 'packages/ide/*'
     - 'tests/*'
